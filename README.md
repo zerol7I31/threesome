@@ -1,3 +1,8 @@
-# threesom
+# threesome
 
-EEEEEEEEEEEEEEEE
+## 以往论文阅读报告
+
+### C篇
+数据清洗->特征分析->模型选择->结果回测->论文
+
+什么叫预测模型的时效性
