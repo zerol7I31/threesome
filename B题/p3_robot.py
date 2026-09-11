@@ -6,7 +6,9 @@ B 题 问题 3 —— 机器狗策略 + 演练驱动
     python p3_robot.py mock   --episodes 20                离线演练：跑 20 局，输出两项统计
     python p3_robot.py sweep  --episodes 8                 参数扫描：对比不同参数组合
     python p3_robot.py live   --url http://127.0.0.1:2026 --team 你的参赛队号
-                                                           连真实模拟器跑一局
+                                                           连真实模拟器跑一局（结束后自动生成 logs/*.html 行为可视化，--no-viz 关闭）
+    python visualize_log.py [logs/xxx.jsonl]               事后为任意日志补生成可视化
+    mock 加 --viz：每局保存 日志+真值+可视化；未清干净的局不加也会自动保存（供调试）
 
 策略结构（分层，便于逐层调参）
     L1 侦察    : 在若干侦察点扫全部频道，得到"候选频道 + 方位约束"
@@ -752,12 +754,14 @@ class Robot(object):
 # 演练驱动
 # ----------------------------------------------------------------------
 def run_episode(seed, params=None, n_sources=None, directional=False,
-                dist="uniform_disk", verbose=False):
+                dist="uniform_disk", verbose=False, keep_log=False):
     arena = MockArena(seed=seed, n_sources=n_sources, directional=directional, dist=dist)
     r = Robot(arena, params)
     robot_rep = r.run()
     t = arena.truth()
     t["robot"] = robot_rep
+    if keep_log:
+        t["_log"] = arena.log          # 供调用方落盘 + 生成可视化（summarize 前先 pop）
     if verbose:
         print("    seed=%-5s 清除 %2d/%2d  虚拟时间 %8.1f s  平均 %7.1f s  "
               "(measure %d, clear %d, 移动 %.0f m)"
@@ -784,12 +788,21 @@ def cmd_mock(args):
     episodes = args.episodes
     s0 = getattr(args, "seed0", 1000)
     direc = getattr(args, "directional", False)
+    dist = getattr(args, "dist", "uniform_disk")
+    viz = getattr(args, "viz", False)
     print("离线演练（%s）：共 %d 局，seed 从 %d 起"
           % ("问题 4：含定向源" if direc else "问题 3：全向源", episodes, s0))
     results = []
     for i in range(episodes):
-        r = run_episode(s0 + i, verbose=True, directional=direc,
-                        dist=getattr(args, "dist", "uniform_disk"))
+        seed = s0 + i
+        r = run_episode(seed, verbose=True, directional=direc, dist=dist,
+                        keep_log=True)
+        log_recs = r.pop("_log", None)
+        failed = r["ratio"] < 0.999999
+        if log_recs and (viz or failed):
+            _save_episode_debug(seed, direc, dist, r, log_recs)
+            if failed and not viz:
+                print("    ※ 该局未清干净：已自动保存 日志+真值+可视化 到 logs/ 供调试")
         results.append(r)
     print()
     summarize(results, "总体")
@@ -822,17 +835,60 @@ def cmd_sweep(args):
               % (name, s["ratio"], s["perfect"], s["n"], s["avg"] or float("nan")))
 
 
-def _save_log(arena, tag="live"):
-    """附件要求：机器狗程序应自行记录指令序列与响应信息（模拟器不提供这一功能）。"""
+def _write_log_records(records, path):
     import json
     import os
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    os.makedirs("logs", exist_ok=True)
-    path = os.path.join("logs", "%s-%s.jsonl" % (tag, stamp))
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
-        for rec in getattr(arena, "log", []):
+        for rec in records:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     return path
+
+
+def _save_log(arena, tag="live"):
+    """附件要求：机器狗程序应自行记录指令序列与响应信息（模拟器不提供这一功能）。"""
+    import os
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    return _write_log_records(getattr(arena, "log", []),
+                              os.path.join("logs", "%s-%s.jsonl" % (tag, stamp)))
+
+
+def _save_truth_sidecar(path, seed, directional, dist, truth):
+    """mock 局的真值侧车：可视化时自动叠加真值图层（真实模拟器没有真值，不生成该文件）。"""
+    import json
+    d = {"seed": seed, "directional": bool(directional), "dist": dist,
+         "sources": {str(c): {"pos": [float(s["pos"][0]), float(s["pos"][1])],
+                              "R": float(s["R"]),
+                              "dir": None if s["dir"] is None else float(s["dir"])}
+                     for c, s in truth.get("sources", {}).items()}}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False)
+    return path
+
+
+def _viz_log(log_path):
+    """仿真结束后按活动日志生成 HTML 行为可视化。可视化失败绝不影响仿真结果本身。"""
+    try:
+        import visualize_log
+        out = visualize_log.render_file(log_path)
+        print("行为可视化已生成：%s" % out)
+        return out
+    except Exception as e:
+        print("可视化生成失败（不影响仿真结果）：%s" % e)
+        return None
+
+
+def _save_episode_debug(seed, directional, dist, result, log_records):
+    """把某一局的 日志+真值+可视化 打包落盘（cmd_mock 的 --viz 与"未清干净自动保存"共用）。"""
+    import os
+    os.makedirs("logs", exist_ok=True)
+    stem = os.path.join("logs", "mock-s%d-%s" % (seed, time.strftime("%Y%m%d-%H%M%S")))
+    lp = _write_log_records(log_records, stem + ".jsonl")
+    _save_truth_sidecar(stem + "-truth.json", seed, directional, dist, result)
+    out = _viz_log(lp)
+    return lp, out
 
 
 def cmd_live(args):
@@ -842,10 +898,13 @@ def cmd_live(args):
         params["tol"] = args.tol
     if args.k_ring is not None:
         params["k_ring"] = args.k_ring
+    if getattr(args, "k_ring_outer", None) is not None:
+        params["k_ring_outer"] = args.k_ring_outer
     r = Robot(arena, params)
     print("连接真实模拟器 %s （robot_id = %s）" % (args.url, args.team))
-    print("策略参数：tol=%s, k_ring=%s" % (params.get("tol", "默认40"),
-                                          params.get("k_ring", "默认3")))
+    print("策略参数：tol=%s, k_ring=%s, k_ring_outer=%s"
+          % (params.get("tol", "默认40"), params.get("k_ring", "默认6"),
+             params.get("k_ring_outer", "默认12")))
     print("正在等待接口开放（最多 %s 秒）——请先在模拟器里点开始并等完 5 秒倒计时。" % args.wait_enter)
     try:
         rep = r.run()
@@ -865,6 +924,8 @@ def cmd_live(args):
           % (rep["vtime"] / rep["cleared"] if rep["cleared"] else float("nan")))
     print("动作统计：", rep["stats"])
     print("本机指令日志已保存：%s" % lp)
+    if not getattr(args, "no_viz", False):
+        _viz_log(lp)
     print("提示：模拟器界面会显示本局干扰源总数与测试案例编码；"
           "正式测试请按表 1 记录，并从模拟器【日志列表】导出加密日志（不要改文件名）。")
 
@@ -955,6 +1016,8 @@ def main():
                    choices=["uniform_disk", "uniform_radius", "boundary", "center", "clustered"])
     m.add_argument("--directional", action="store_true",
                    help="生成问题 4 的混合案例（约一半为定向源）")
+    m.add_argument("--viz", action="store_true",
+                   help="每局保存 日志+真值+HTML 可视化到 logs/（未清干净的局不加也会自动保存）")
     m.set_defaults(func=cmd_mock)
 
     d = sub.add_parser("dist")
@@ -977,8 +1040,12 @@ def main():
     l.add_argument("--team", required=True, help="参赛队号，必须与模拟器登录的队号一致")
     l.add_argument("--wait-enter", type=float, default=60.0,
                    help="等待接口开放的最长秒数（模拟器有 5 秒倒计时，建议 ≥30）")
-    l.add_argument("--tol", type=float, default=None, help="覆盖收敛阈值（默认 40 m）")
-    l.add_argument("--k-ring", type=int, default=None, help="覆盖侦察环点数（默认 3）")
+    l.add_argument("--tol", type=float, default=None, help="覆盖收敛阈值（默认 40 m；全向源可放宽到 60~80）")
+    l.add_argument("--k-ring", type=int, default=None, help="内侦察环点数（默认 6）")
+    l.add_argument("--k-ring-outer", type=int, default=None,
+                   help="外侦察环点数（默认 12，为定向源兜边界）。跑问题3（全向源）传 0 可省 ~1/3 虚拟时间")
+    l.add_argument("--no-viz", action="store_true",
+                   help="结束后不生成 HTML 行为可视化（默认自动生成到 logs/）")
     l.set_defaults(func=cmd_live)
 
     args = ap.parse_args()
