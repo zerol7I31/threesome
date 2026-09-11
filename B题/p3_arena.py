@@ -333,5 +333,48 @@ class HttpArena(object):
                 time.sleep(0.3 * (attempt + 1))
         raise RuntimeError("连接模拟器失败（已重试 %d 次）：%s" % (self.retries, last_err))
 
+    def request_patient(self, path, payload, wait_s, verbose=True):
+        """
+        耐心等待接口就绪后再发指令 —— 专门用于 /enter。
+
+        为什么需要：模拟器是"确认开始 → 5 秒倒计时 → 才开放接口"。
+        如果程序在倒计时期间就发 /enter，会直接连不上（没有 JSON 响应）。
+        这里按 1 秒一次的节奏重发【完全相同】的 payload 与 request_id：
+        按协议，同一 request_id 重试是幂等的，绝不会重复进入区域。
+        """
+        body = json.dumps(payload).encode("utf-8")
+        t0 = time.time()
+        last = None
+        n = 0
+        while True:
+            n += 1
+            req = Request(self.base_url + path, data=body,
+                          headers={"Content-Type": "application/json"}, method="POST")
+            try:
+                with urlopen(req, timeout=self.timeout) as r:
+                    resp = json.loads(r.read().decode("utf-8"))
+                if isinstance(resp, dict) and "accepted" in resp:
+                    self.log.append({"path": path, "payload": payload, "resp": resp})
+                    return resp
+                last = "响应缺少 accepted 字段"
+            except HTTPError as e:
+                raw = e.read().decode("utf-8", "replace")
+                try:
+                    resp = json.loads(raw)
+                except Exception:
+                    resp = None
+                if isinstance(resp, dict) and "accepted" in resp:
+                    resp.setdefault("_http", e.code)
+                    self.log.append({"path": path, "payload": payload, "resp": resp})
+                    return resp
+                last = "HTTP %d %s" % (e.code, raw[:80])
+            except (URLError, OSError, TimeoutError) as e:
+                last = str(e)
+            if time.time() - t0 >= wait_s:
+                raise RuntimeError("等待接口就绪超过 %.0f 秒仍未成功：%s" % (wait_s, last))
+            if verbose and n % 5 == 0:
+                print("   ... 接口尚未就绪，已等待 %.0f 秒（倒计时是否还没结束？）" % (time.time() - t0))
+            time.sleep(1.0)
+
     def truth(self):
         return {"note": "真实模拟器不提供真值；演练测试结束时界面会显示干扰源总数。"}
